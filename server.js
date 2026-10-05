@@ -75,19 +75,22 @@ function createApp({ rzp, mailer }) {
   // Razorpay webhook (needs the raw body). This is the ONLY place the owner email is sent.
   app.post('/api/webhook', express.raw({ type: '*/*', limit: '200kb' }), async (req, res) => {
     const sig = req.get('x-razorpay-signature') || '';
-    if (!E.RAZORPAY_WEBHOOK_SECRET || !safeEq(hmac(E.RAZORPAY_WEBHOOK_SECRET, req.body), sig)) return res.status(400).send('bad signature');
+    if (!E.RAZORPAY_WEBHOOK_SECRET) { console.error('WEBHOOK REJECTED: RAZORPAY_WEBHOOK_SECRET is not set in the server settings'); return res.status(400).send('bad signature'); }
+    if (!safeEq(hmac(E.RAZORPAY_WEBHOOK_SECRET, req.body), sig)) { console.error('WEBHOOK REJECTED: secret mismatch. The secret in Razorpay must be exactly the same as RAZORPAY_WEBHOOK_SECRET here'); return res.status(400).send('bad signature'); }
     try {
       const ev = JSON.parse(req.body.toString());
+      console.log('Webhook received: ' + ev.event);
       if (ev.event === 'order.paid') {
         const order = ev.payload.order.entity, payment = ev.payload.payment.entity;
         const m = orderEmail(order, payment);
         await mailer.sendMail({ from: E.GMAIL_USER, to: E.OWNER_EMAIL || E.GMAIL_USER, subject: m.subject, text: m.text });
+        console.log('Owner email sent for order ' + order.receipt);
         const cust = (order.notes || {}).email;
         if (cust) await mailer.sendMail({ from: E.GMAIL_USER, to: cust, subject: `Your Knotty & Nice order ${order.receipt}`,
           text: `Thank you for your order!\n\nWe received your payment of ${inr(order.amount / 100)}. We will pack it and ship it soon.\nOrder number: ${order.receipt}\n\nKnotty & Nice - Handmade with love\n` });
       }
       res.send('ok');
-    } catch (e) { console.error('webhook error', e.message); res.status(500).send('error'); }  // Razorpay will retry
+    } catch (e) { console.error('WEBHOOK ERROR (email could not be sent):', e.message); res.status(500).send('error'); }  // Razorpay will retry
   });
 
   app.use(express.json({ limit: '50kb' }));
@@ -123,5 +126,8 @@ if (require.main === module) {
   const Razorpay = require('razorpay'), nodemailer = require('nodemailer');
   const rzp = new Razorpay({ key_id: E.RAZORPAY_KEY_ID, key_secret: E.RAZORPAY_KEY_SECRET });
   const mailer = nodemailer.createTransport({ service: 'gmail', auth: { user: E.GMAIL_USER, pass: E.GMAIL_APP_PASSWORD } });
+  const need = ['RAZORPAY_KEY_ID','RAZORPAY_KEY_SECRET','RAZORPAY_WEBHOOK_SECRET','GMAIL_USER','GMAIL_APP_PASSWORD','SITE_URL'].filter(k => !E[k]);
+  if (need.length) console.error('MISSING SETTINGS: ' + need.join(', '));
+  mailer.verify().then(() => console.log('Gmail check: OK (login accepted)'), e => console.error('Gmail check: FAILED - ' + e.message + ' (create a new app password and update GMAIL_APP_PASSWORD)'));
   createApp({ rzp, mailer }).listen(E.PORT || 3000, () => console.log('Server running'));
 }
