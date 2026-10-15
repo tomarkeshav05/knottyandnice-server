@@ -8,10 +8,15 @@ const E = process.env;
 const SCENTS = ['Lavender','Rose','Jasmine','Vanilla','Sandalwood','Lemon','Orange','Mint','Ocean Breeze','Coffee','Chocolate','Lily']; // must match the website list
 const inr = n => 'Rs.' + Number(n).toLocaleString('en-IN');
 
+const FREE_SHIP_FROM = 1499;   // free shipping when the order (after any discount) is Rs.1499 or more
+const SHIP_FEE = 79;
+const FIRST_ORDER_PCT = 0.10;  // 10% off the first paid order from a phone number
+
 // ---- Pricing: always computed here, never trusted from the browser ----
-function priceCart(items, coupon) {
+// firstOrder = true when this phone number has no earlier PAID order (see paidPhoneBook below).
+function priceCart(items, firstOrder) {
   if (!Array.isArray(items) || !items.length || items.length > 30) throw new Error('Your cart is empty or too large.');
-  let sub = 0; const lines = [], units = [];   // units: prices of items eligible for Buy 3 Get 1 Free
+  let sub = 0; const lines = [];
   for (const it of items) {
     const q = Math.floor(+it.q);
     if (!(q >= 1 && q <= 20)) throw new Error('Invalid quantity.');
@@ -32,16 +37,13 @@ function priceCart(items, coupon) {
       if (p.v && !v) throw new Error('Invalid option.');
       if (p.sc && !SCENTS.includes(it.s)) throw new Error('Please choose a fragrance for ' + p.n + '.');
       const price = v ? v[1] : p.p; sub += price * q;
-      if (p.c !== 'Hampers') for (let n = 0; n < q; n++) units.push(price);   // hampers are not part of the offer
       lines.push(`${q} x ${p.n}${v ? ' (' + v[0] + ')' : ''}${p.sc ? ' [Fragrance: ' + it.s + ']' : ''} @ ${inr(price)}`);
     }
   }
-  // Buy 3 Get 1 Free: for every 4 eligible items, the lowest-priced one is free. Coupons cannot be combined with it.
-  units.sort((a, b) => a - b);
-  const bogo = units.slice(0, Math.floor(units.length / 4)).reduce((a, b) => a + b, 0);
-  const disc = bogo || (String(coupon || '').toUpperCase() === 'KNOTTY10' ? sub * 0.1 : 0);
-  const net = sub - disc, ship = net >= 999 ? 0 : 79;
-  return { sub, bogo, disc: Math.round(disc), ship, total: Math.round(net + ship), lines };
+  // The only offer: 10% off the whole cart on a customer's first paid order.
+  const disc = firstOrder ? Math.round(sub * FIRST_ORDER_PCT) : 0;
+  const net = sub - disc, ship = net >= FREE_SHIP_FROM ? 0 : SHIP_FEE;
+  return { sub, first: !!firstOrder, disc, ship, total: net + ship, lines };
 }
 
 function checkCustomer(c = {}) {
@@ -54,6 +56,36 @@ function checkCustomer(c = {}) {
   return { name: t('name').slice(0, 80), phone: t('phone'), email: t('email').slice(0, 120), address: t('address').slice(0, 240), pin: t('pin') };
 }
 
+// ---- "First order" check ----
+// The server stores nothing itself (Render's free plan forgets files). Razorpay is the record: every order keeps the
+// customer's phone number in its notes, and Razorpay marks it status "paid". We read those orders (and keep the set of
+// phones in memory, topped up from Razorpay every few seconds and instantly by the payment webhook).
+// Only PAID orders count, so someone who started a checkout but never paid still gets the offer.
+function paidPhoneBook(rzp) {
+  const phones = new Set(); let loaded = false, syncedAt = 0, running = null;
+  async function pull() {
+    const startedAt = Math.floor(Date.now() / 1000);
+    const from = loaded ? Math.max(1, syncedAt - 3 * 86400) : undefined;   // later top-ups re-read the last 3 days, to catch orders paid late
+    for (let page = 0; page < 100; page++) {                                // up to 10,000 orders on a full load
+      const r = await rzp.orders.all(from ? { from, count: 100, skip: page * 100 } : { count: 100, skip: page * 100 });
+      const items = (r && r.items) || [];
+      for (const o of items) { const ph = String((o.notes || {}).phone || ''); if (o.status === 'paid' && /^\d{10}$/.test(ph)) phones.add(ph); }
+      if (items.length < 100) break;
+    }
+    syncedAt = startedAt; loaded = true;
+  }
+  const sync = () => (running = running || pull().finally(() => { running = null; }));
+  return {
+    add: ph => { if (/^\d{10}$/.test(String(ph || ''))) phones.add(String(ph)); },
+    // true = no paid order yet from this phone. If Razorpay cannot be reached this throws, and the order is not created.
+    async isFirstOrder(ph) {
+      if (phones.has(ph)) return false;
+      if (!loaded || Date.now() / 1000 - syncedAt > 15) await sync();
+      return !phones.has(ph);
+    }
+  };
+}
+
 const safeEq = (a, b) => { const x = Buffer.from(a), y = Buffer.from(b); return x.length === y.length && crypto.timingSafeEqual(x, y); };
 const hmac = (secret, text) => crypto.createHmac('sha256', secret).update(text).digest('hex');
 
@@ -62,7 +94,7 @@ function orderEmail(order, payment) {
   const items = [1, 2, 3, 4, 5, 6].map(i => n['items' + i]).filter(Boolean).join('').split(' ;; ').join('\n');
   return {
     subject: `PAID order ${order.receipt} - ${inr(order.amount / 100)}`,
-    text: `You have a new PAID order. Please pack and ship it.\n\nOrder: ${order.receipt}\nAmount paid: ${inr(order.amount / 100)} (${payment.method || 'online'})\nPayment ID: ${payment.id}\n\nCUSTOMER\n${n.name}\nPhone: ${n.phone}\nEmail: ${n.email || '-'}\n${n.address}\nPIN: ${n.pin}\n\nITEMS\n${items}\n\nCoupon: ${n.coupon || 'none'}\n${n.totals || ''}\n`
+    text: `You have a new PAID order. Please pack and ship it.\n\nOrder: ${order.receipt}\nAmount paid: ${inr(order.amount / 100)} (${payment.method || 'online'})\nPayment ID: ${payment.id}\n\nCUSTOMER\n${n.name}\nPhone: ${n.phone}\nEmail: ${n.email || '-'}\n${n.address}\nPIN: ${n.pin}\n\nITEMS\n${items}\n\nOffer: ${n.coupon || 'none'}\n${n.totals || ''}\n`
   };
 }
 
@@ -81,6 +113,7 @@ function resendMailer(apiKey) {
 
 function createApp({ rzp, mailer }) {
   const app = express();
+  const book = paidPhoneBook(rzp);
   app.set('trust proxy', 1);
   app.use(helmet());
   app.use(cors({ origin: (E.SITE_URL || '').split(',').map(s => s.trim()).filter(Boolean) }));
@@ -95,6 +128,7 @@ function createApp({ rzp, mailer }) {
       console.log('Webhook received: ' + ev.event);
       if (ev.event === 'order.paid') {
         const order = ev.payload.order.entity, payment = ev.payload.payment.entity;
+        book.add((order.notes || {}).phone);   // this phone has now used its first-order offer
         const m = orderEmail(order, payment);
         await mailer.sendMail({ from: FROM(), to: OWNER_TO(), subject: m.subject, text: m.text });
         console.log('Owner email sent for order ' + order.receipt);
@@ -111,14 +145,24 @@ function createApp({ rzp, mailer }) {
   app.use('/api/', rateLimit({ windowMs: 60000, max: 40 }));
   app.get('/', (_, res) => res.send('Knotty & Nice server is running.'));
 
+  // Lets the checkout page show the real total (with or without the first-order 10%) before payment starts.
+  app.post('/api/quote', rateLimit({ windowMs: 60000, max: 15 }), async (req, res) => {
+    try {
+      const phone = String((req.body || {}).phone || '').trim();
+      if (!/^\d{10}$/.test(phone)) throw new Error('Enter a 10-digit phone number.');
+      const c = priceCart(req.body.items, await book.isFirstOrder(phone));
+      res.json({ first: c.first, sub: c.sub, disc: c.disc, ship: c.ship, total: c.total });
+    } catch (e) { res.status(400).json({ error: e.error ? 'Could not check your offer. Please try again.' : e.message }); }
+  });
+
   app.post('/api/create-order', async (req, res) => {
     try {
       const customer = checkCustomer(req.body.customer);
-      const cart = priceCart(req.body.items, req.body.coupon);
+      const cart = priceCart(req.body.items, await book.isFirstOrder(customer.phone));
       const text = cart.lines.join(' ;; ');
       if (text.length > 1500) throw new Error('Cart too large. Please place two separate orders.');
       const receipt = 'KN' + Date.now().toString().slice(-8);
-      const notes = { ...customer, coupon: cart.bogo ? 'Buy 3 Get 1 Free' : cart.disc ? 'KNOTTY10' : '', totals: `Subtotal ${inr(cart.sub)}, discount ${inr(cart.disc)}, shipping ${inr(cart.ship)}` };
+      const notes = { ...customer, coupon: cart.first ? 'First-order 10% off' : '', totals: `Subtotal ${inr(cart.sub)}, discount ${inr(cart.disc)}, shipping ${inr(cart.ship)}` };
       text.match(/[\s\S]{1,250}/g).forEach((c, i) => { notes['items' + (i + 1)] = c; });
       const order = await rzp.orders.create({ amount: cart.total * 100, currency: 'INR', receipt, notes });
       res.json({ id: order.id, amount: order.amount, receipt, key: E.RAZORPAY_KEY_ID });
@@ -134,7 +178,7 @@ function createApp({ rzp, mailer }) {
   return app;
 }
 
-module.exports = { createApp, priceCart, hmac, resendMailer };
+module.exports = { createApp, priceCart, paidPhoneBook, hmac, resendMailer };
 
 if (require.main === module) {
   const Razorpay = require('razorpay'), nodemailer = require('nodemailer');
